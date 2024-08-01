@@ -30,9 +30,12 @@ type SerialIO struct {
 	conn        io.ReadWriteCloser
 
 	lastKnownNumSliders        int
+	lastKnownNumButtons        int
 	currentSliderPercentValues []float32
+	currentButtonDigitalValue  []bool
 
-	sliderMoveConsumers []chan SliderMoveEvent
+	sliderMoveConsumers  []chan SliderMoveEvent
+	buttonPressConsumers []chan ButtonPressEvent
 }
 
 // SliderMoveEvent represents a single slider move captured by deej
@@ -41,7 +44,13 @@ type SliderMoveEvent struct {
 	PercentValue float32
 }
 
-var expectedLinePattern = regexp.MustCompile(`^\d{1,4}(\|\d{1,4})*\r\n$`)
+// ButtonPressEvent represents a single button press captured by deej
+type ButtonPressEvent struct {
+	ButtonID int
+	Pressed  bool
+}
+
+var expectedLinePattern = regexp.MustCompile(`^(\d{1,4}|B[0-1])(\|\d{1,4}|B[0-1])*\r\n$`)
 
 // NewSerialIO creates a SerialIO instance that uses the provided deej
 // instance's connection info to establish communications with the arduino chip
@@ -49,12 +58,13 @@ func NewSerialIO(deej *Deej, logger *zap.SugaredLogger) (*SerialIO, error) {
 	logger = logger.Named("serial")
 
 	sio := &SerialIO{
-		deej:                deej,
-		logger:              logger,
-		stopChannel:         make(chan bool),
-		connected:           false,
-		conn:                nil,
-		sliderMoveConsumers: []chan SliderMoveEvent{},
+		deej:                 deej,
+		logger:               logger,
+		stopChannel:          make(chan bool),
+		connected:            false,
+		conn:                 nil,
+		sliderMoveConsumers:  []chan SliderMoveEvent{},
+		buttonPressConsumers: []chan ButtonPressEvent{},
 	}
 
 	logger.Debug("Created serial i/o instance")
@@ -146,6 +156,15 @@ func (sio *SerialIO) SubscribeToSliderMoveEvents() chan SliderMoveEvent {
 	return ch
 }
 
+// SubscribeToButtonPressEvents returns an unbuffered channel that receives
+// a ButtonPressEvent struct every time a button is pressed or released
+func (sio *SerialIO) SubscribeToButtonPressEvents() chan ButtonPressEvent {
+	ch := make(chan ButtonPressEvent)
+	sio.buttonPressConsumers = append(sio.buttonPressConsumers, ch)
+
+	return ch
+}
+
 func (sio *SerialIO) setupOnConfigReload() {
 	configReloadedChannel := sio.deej.config.SubscribeToChanges()
 
@@ -164,6 +183,7 @@ func (sio *SerialIO) setupOnConfigReload() {
 				go func() {
 					<-time.After(stopDelay)
 					sio.lastKnownNumSliders = 0
+					sio.lastKnownNumButtons = 0
 				}()
 
 				// if connection params have changed, attempt to stop and start the connection
@@ -226,6 +246,15 @@ func (sio *SerialIO) readLine(logger *zap.SugaredLogger, reader *bufio.Reader) c
 	return ch
 }
 
+// Helper function to check if a string is a numerical string between "0" and "1023"
+func isNumericalString(s string) bool {
+	_, err := strconv.Atoi(s)
+	if err != nil {
+		return false
+	}
+	return true
+}
+
 func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 
 	// this function receives an unsanitized line which is guaranteed to end with LF,
@@ -238,9 +267,25 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 	// trim the suffix
 	line = strings.TrimSuffix(line, "\r\n")
 
-	// split on pipe (|), this gives a slice of numerical strings between "0" and "1023"
+	// split on pipe (|), this gives a slice of numerical strings between "0" and "1023" or B1 and B0
 	splitLine := strings.Split(line, "|")
-	numSliders := len(splitLine)
+
+	var sliderStrings []string
+	var buttonStrings []string
+
+	// Iterate through the split line and classify elements
+	for _, element := range splitLine {
+		if isNumericalString(element) {
+			sliderStrings = append(sliderStrings, element)
+		} else if strings.HasPrefix(element, "B") {
+			buttonStrings = append(buttonStrings, element)
+		} else {
+			sio.logger.Debugw("Got malformed line from serial, ignoring", "line", line)
+		}
+	}
+
+	numSliders := len(sliderStrings)
+	numButtons := len(buttonStrings)
 
 	// update our slider count, if needed - this will send slider move events for all
 	if numSliders != sio.lastKnownNumSliders {
@@ -254,9 +299,23 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 		}
 	}
 
+	// update our Button count, if needed - this will send slider move events for all
+	if numButtons != sio.lastKnownNumButtons {
+		logger.Infow("Detected buttons", "amount", numButtons)
+		sio.lastKnownNumButtons = numButtons
+		sio.currentButtonDigitalValue = make([]bool, numButtons)
+
+		//TODO
+		//find a way to force upddate
+		//// reset everything to be an impossible value to force the slider move event later
+		//for idx := range sio.currentButtonDigitalValue {
+		//	sio.currentButtonDigitalValue[idx] = false
+		//}
+	}
+
 	// for each slider:
 	moveEvents := []SliderMoveEvent{}
-	for sliderIdx, stringValue := range splitLine {
+	for sliderIdx, stringValue := range sliderStrings {
 
 		// convert string values to integers ("1023" -> 1023)
 		number, _ := strconv.Atoi(stringValue)
@@ -301,6 +360,42 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 		for _, consumer := range sio.sliderMoveConsumers {
 			for _, moveEvent := range moveEvents {
 				consumer <- moveEvent
+			}
+		}
+	}
+
+	// for each button:
+	buttonEvents := []ButtonPressEvent{}
+	for buttonIdx, stringValue := range buttonStrings {
+
+		value := false
+		// extract bool value
+		if stringValue == "B1" {
+			value = true
+		} else if stringValue == "B0" {
+			value = false
+		} else {
+			sio.logger.Debugw("Got malformed line from serial, ignoring (Button value out of scope)", "line", line)
+		}
+
+		//No debounce here neets to be done an the Arduino side
+
+		sio.currentButtonDigitalValue[buttonIdx] = value
+		buttonEvents = append(buttonEvents, ButtonPressEvent{
+			ButtonID: buttonIdx,
+			Pressed:  value,
+		})
+
+		if sio.deej.Verbose() {
+			logger.Debugw("Button Pressed", "event", buttonEvents[len(buttonEvents)-1])
+		}
+	}
+
+	// deliver Button events if there are any, towards all potential consumers
+	if len(buttonEvents) > 0 {
+		for _, consumer := range sio.buttonPressConsumers {
+			for _, buttonEvent := range buttonEvents {
+				consumer <- buttonEvent
 			}
 		}
 	}
